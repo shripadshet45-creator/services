@@ -14,10 +14,19 @@ spec:
     metadata:
       labels:
         app: account-service
+        azure.workload.identity/use: "true"
     spec:
+      serviceAccountName: account-service
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: account-service-kv
       containers:
         - name: account-service
-          image: account-service:latest
+          image: acrakslearningshripad.azurecr.io/account-service:2957ae6b39871e720a239fb21fe422704a391873
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -25,6 +34,23 @@ spec:
           envFrom:
             - configMapRef:
                 name: account-service-config
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+          env:
+            - name: DB_URL
+              value: jdbc:postgresql://postgres.money-movement.svc.cluster.local:5432/accounts
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: account-service-db
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: account-service-db
+                  key: password
           resources:
             requests:
               cpu: 100m
