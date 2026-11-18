@@ -1,0 +1,205 @@
+name: Account Service CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "account-service/**"
+      - ".github/workflows/account-service-ci-cd.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "account-service/**"
+      - ".github/workflows/account-service-ci-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  packages: read
+
+concurrency:
+  group: account-service-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVICE_DIR: account-service
+  IMAGE_NAME: account-service
+
+jobs:
+  unit-tests:
+    name: 1. Unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.SERVICE_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run unit tests
+        run: mvn --batch-mode --no-transfer-progress test
+
+      - name: Publish test report
+        if: always()
+        uses: dorny/test-reporter@v2
+        with:
+          name: Account Service Unit Tests
+          path: account-service/target/surefire-reports/*.xml
+          reporter: java-junit
+
+  sonar:
+    name: 2. Sonar scan
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.SERVICE_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Sonar scan
+        env:
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn --batch-mode --no-transfer-progress verify -DskipTests \
+            sonar:sonar \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.login="$SONAR_TOKEN"
+
+  maven-build:
+    name: 3. Maven build
+    needs: sonar
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.SERVICE_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Package application
+        run: mvn --batch-mode --no-transfer-progress -DskipTests package
+
+      - name: Upload Maven artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: account-service-jar
+          path: account-service/target/*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  blackduck:
+    name: 4. Black Duck scan
+    needs: maven-build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run Black Duck Detect
+        env:
+          BLACKDUCK_URL: ${{ vars.BLACKDUCK_URL }}
+          BLACKDUCK_API_TOKEN: ${{ secrets.BLACKDUCK_API_TOKEN }}
+        run: |
+          curl --fail --location --retry 3 --output detect.sh https://detect.synopsys.com/detect10.sh
+          bash detect.sh \
+            --detect.project.name="account-service" \
+            --detect.project.version.name="${{ github.sha }}" \
+            --detect.source.path="account-service" \
+            --detect.blackduck.scan.mode=RAPID \
+            --detect.blackduck.rapid.compare.mode=BOM_COMPARE_STRICT \
+            --detect.cleanup=true
+
+  image-build-scan-push:
+    name: 5. Build, scan, and push image
+    needs: blackduck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Maven artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: account-service-jar
+          path: account-service/target
+
+      - name: Set image variables
+        id: image
+        shell: bash
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          if [ -z "$ACR_LOGIN_SERVER" ]; then
+            echo "ACR_LOGIN_SERVER repository variable is required" >&2
+            exit 1
+          fi
+          echo "tag=$ACR_LOGIN_SERVER/account-service:${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$ACR_LOGIN_SERVER/account-service:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./account-service
+          push: false
+          load: true
+          tags: |
+            ${{ steps.image.outputs.tag }}
+            ${{ steps.image.outputs.sha_tag }}
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image.outputs.tag }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Azure login
+        if: github.event_name != 'pull_request'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to ACR
+        if: github.event_name != 'pull_request'
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Push Docker image
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "${{ steps.image.outputs.tag }}"
+          docker push "${{ steps.image.outputs.sha_tag }}"
+          docker tag "${{ steps.image.outputs.tag }}" "${{ vars.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
+          docker push "${{ vars.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
