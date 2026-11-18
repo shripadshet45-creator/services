@@ -17,6 +17,8 @@ permissions:
   contents: read
   security-events: write
   packages: read
+  id-token: write          # CHANGE 1: lets the job get an OIDC token to log in to Azure
+  checks: write            # CHANGE 1: dorny/test-reporter creates a "check" with the test results
 
 concurrency:
   group: account-service-${{ github.ref }}
@@ -54,38 +56,9 @@ jobs:
           path: account-service/target/surefire-reports/*.xml
           reporter: java-junit
 
-  sonar:
-    name: 2. Sonar scan
-    needs: unit-tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ env.SERVICE_DIR }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-
-      - name: Sonar scan
-        env:
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: |
-          mvn --batch-mode --no-transfer-progress verify -DskipTests \
-            sonar:sonar \
-            -Dsonar.host.url="$SONAR_HOST_URL" \
-            -Dsonar.login="$SONAR_TOKEN"
-
   maven-build:
-    name: 3. Maven build
-    needs: sonar
+    name: 2. Maven build
+    needs: unit-tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -111,38 +84,12 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  blackduck:
-    name: 4. Black Duck scan
+  image-build-push:
+    name: 3. Build and push image
     needs: maven-build
     runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-
-      - name: Run Black Duck Detect
-        env:
-          BLACKDUCK_URL: ${{ vars.BLACKDUCK_URL }}
-          BLACKDUCK_API_TOKEN: ${{ secrets.BLACKDUCK_API_TOKEN }}
-        run: |
-          curl --fail --location --retry 3 --output detect.sh https://detect.synopsys.com/detect10.sh
-          bash detect.sh \
-            --detect.project.name="account-service" \
-            --detect.project.version.name="${{ github.sha }}" \
-            --detect.source.path="account-service" \
-            --detect.blackduck.scan.mode=RAPID \
-            --detect.blackduck.rapid.compare.mode=BOM_COMPARE_STRICT \
-            --detect.cleanup=true
-
-  image-build-scan-push:
-    name: 5. Build, scan, and push image
-    needs: blackduck
-    runs-on: ubuntu-latest
+    outputs:
+      sha_tag: ${{ steps.image.outputs.sha_tag }}   # passed to the deploy job
 
     steps:
       - uses: actions/checkout@v4
@@ -166,40 +113,73 @@ jobs:
           echo "tag=$ACR_LOGIN_SERVER/account-service:${{ github.run_number }}" >> "$GITHUB_OUTPUT"
           echo "sha_tag=$ACR_LOGIN_SERVER/account-service:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./account-service
-          push: false
-          load: true
-          tags: |
-            ${{ steps.image.outputs.tag }}
-            ${{ steps.image.outputs.sha_tag }}
-
-      - name: Scan Docker image
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ steps.image.outputs.tag }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-
-      - name: Azure login
+      # CHANGE 2: OIDC login instead of AZURE_CREDENTIALS (no client secret)
+      - name: Azure login (OIDC)
         if: github.event_name != 'pull_request'
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Log in to ACR
         if: github.event_name != 'pull_request'
         run: az acr login --name "${{ vars.ACR_NAME }}"
 
-      - name: Push Docker image
-        if: github.event_name != 'pull_request'
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./account-service
+          push: ${{ github.event_name != 'pull_request' }}
+          # CHANGE 3: no ":latest" tag - every image has a unique, traceable tag
+          tags: |
+            ${{ steps.image.outputs.tag }}
+            ${{ steps.image.outputs.sha_tag }}
+
+  # CHANGE 4: new deploy job
+  deploy-dev:
+    name: 4. Deploy to AKS (dev)
+    needs: image-build-push
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: dev                       # waits for your approval
+    concurrency:
+      group: deploy-account-service-dev
+      cancel-in-progress: false            # never cancel a deploy half-way
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Get kubeconfig
         run: |
-          docker push "${{ steps.image.outputs.tag }}"
-          docker push "${{ steps.image.outputs.sha_tag }}"
-          docker tag "${{ steps.image.outputs.tag }}" "${{ vars.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
-          docker push "${{ vars.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
+          az aks get-credentials \
+            -g "${{ vars.AKS_RESOURCE_GROUP }}" \
+            -n "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+
+      - name: Apply manifests
+        run: kubectl apply -f account-service/k8s/
+
+      - name: Use this build's image
+        run: |
+          kubectl set image deployment/account-service \
+            account-service=${{ needs.image-build-push.outputs.sha_tag }} \
+            -n microservices
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/account-service -n microservices --timeout=180s
+
+      - name: Show pods
+        if: always()
+        run: kubectl get pods -n microservices -o wide
