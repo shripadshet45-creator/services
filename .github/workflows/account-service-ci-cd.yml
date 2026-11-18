@@ -175,11 +175,11 @@ jobs:
         run: |
           kubectl set image deployment/account-service \
             account-service=${{ needs.image-build-push.outputs.sha_tag }} \
-            -n microservices
+            -n money-movement
 
       - name: Wait for rollout
-        run: kubectl rollout status deployment/account-service -n microservices --timeout=180s
+        run: kubectl rollout status deployment/account-service -n money-movement --timeout=180s
 
       - name: Show pods
         if: always()
-        run: kubectl get pods -n microservices -o wide
+        run: kubectl get pods -n money-movement -o wide
